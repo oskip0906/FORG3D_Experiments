@@ -101,8 +101,8 @@ def convert_csv_to_jsonl(csv_path, jsonl_path):
 if __name__ == "__main__":
     questions = []
     # Navigate to the root directory
-    root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-    os.chdir(root_dir)
+    # root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    # os.chdir(root_dir)
     # Extract all files from output
     images_source = "output/images"
     images_destination = "output/images_data"
@@ -116,9 +116,8 @@ if __name__ == "__main__":
             metadata = json.load(f)
             questions.extend(generate_questions(metadata))
     # Generate csv and jsonl files
-    csv_file = "experiments/questions.csv"
+    csv_file = "questions.csv"
     generate_csv(questions, csv_file)
-    jsonl_file = "experiments/training_data.jsonl"
+    jsonl_file = "testing_data.jsonl"
     convert_csv_to_jsonl(csv_file, jsonl_file)
     print(f"Generated {len(questions)} questions in {csv_file} and {jsonl_file}")
-   

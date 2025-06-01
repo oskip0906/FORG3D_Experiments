@@ -29,7 +29,7 @@ parser.add_argument('--batch_size', default=8, type=int)
 parser.add_argument('--learning_rate', default=5e-5, type=float)
 parser.add_argument('--evaluate_before_training', action='store_true', default=False)
 parser.add_argument('--freeze', choices=['vision', 'text'], required=False)
-parser.add_argument('--grad_acc', default=4, type=int)
+parser.add_argument('--grad_acc', default=8, type=int)
 parser.add_argument('--weight_decay', default=0.01, type=float)
 parser.add_argument('--eval_steps', default=100, type=int)
 parser.add_argument('--eval_strat', default='steps', type=str)
@@ -38,8 +38,8 @@ parser.add_argument('--save_steps', default=500, type=int)
 parser.add_argument('--save_strat', default='steps', type=str)
 parser.add_argument('--save_total_limit', default=1, type=int)
 parser.add_argument('--lora', action='store_true', default=False, help='Use LoRA')
-parser.add_argument('--lora_r', default=8, type=int)
-parser.add_argument('--lora_alpha', default=32, type=int)
+parser.add_argument('--lora_r', default=16, type=int)
+parser.add_argument('--lora_alpha', default=16, type=int)
 parser.add_argument('--lora_dropout', default=0.1, type=float)
 args = parser.parse_args()
 
@@ -48,16 +48,16 @@ print(json.dumps(vars(args), indent=2))
 
 device_string = PartialState().process_index
 
-# Load Processor
+# Load processor
 min_pixels = 256 * 28 * 28
 max_pixels = 1024 * 28 * 28
 processor = AutoProcessor.from_pretrained(
-    args.model,                    
+    args.model,
     min_pixels=min_pixels,
     max_pixels=max_pixels,
 )
-# print("Setting padding side to right")
-# processor.padding_side = 'right'
+
+# Max sequence length for the model
 max_seq_length = 4096
 
 # Load dataset from JSONL file using the new format
@@ -106,8 +106,8 @@ print(formatted_dataset[0])
 
 dataset = Dataset.from_list(formatted_dataset)
 print(f"Dataset: {dataset}")
-# exit()
 
+# Add <image> special token if missing
 image_token = "<image>"
 if image_token not in processor.tokenizer.additional_special_tokens:
     processor.tokenizer.add_special_tokens({'additional_special_tokens': [image_token]})
@@ -124,35 +124,42 @@ def make_pil_image(image_path):
         return None
 
 def collate_fn(examples):
-    prompts = [e["prompt"] for e in examples]
-    images = [[make_pil_image(i) for i in e["images"]] for e in examples]
-    answers = [
-        re.search(r"<\|im_start\|>assistant\n([A-D])<\|im_end\|>", e["prompt"]).group(1)
-        for e in examples
-    ]
+    valid_examples = []
+    answers = []
+    for e in examples:
+        m = re.search(r"<\|im_start\|>assistant\s*([A-D])<\|im_end\|>", e["prompt"])
+        if not m:
+            continue
+        answers.append(m.group(1))
+        valid_examples.append(e)
 
-    # Tokenize the prompt and images
+    # If nothing valid remains, skip this batch
+    if not valid_examples:
+        return {}
+    
+    prompts = [e["prompt"] for e in valid_examples]
+    images  = [[make_pil_image(i) for i in e["images"]] for e in valid_examples]
+
+    # Tokenize prompts and images
     batch = processor(text=prompts, images=images, return_tensors="pt", padding=True)
     batch.pixel_values = batch.pixel_values.to(model.dtype)
-
     input_ids = batch["input_ids"]
-    labels = input_ids.clone()
 
-    # Mask everything by default
-    labels[:, :] = -100
+    # Initialize all labels to -100
+    labels = torch.full_like(input_ids, -100)
 
+    # Un-mask only the correct answer token for each valid example
     for i, answer in enumerate(answers):
         answer_ids = processor.tokenizer(answer, add_special_tokens=False)["input_ids"]
-        answer_len = len(answer_ids)
-
-        # Try to find where the answer starts in the input
-        for j in range(input_ids.size(1) - answer_len + 1):
-            if input_ids[i, j:j + answer_len].tolist() == answer_ids:
-                labels[i, j:j + answer_len] = input_ids[i, j:j + answer_len]
+        L = len(answer_ids)
+        for j in range(input_ids.size(1) - L + 1):
+            if input_ids[i, j:j+L].tolist() == answer_ids:
+                labels[i, j:j+L] = input_ids[i, j:j+L]
                 break
 
-    # Mask out padding and image tokens
-    labels[input_ids == processor.tokenizer.pad_token_id] = -100
+    # Mask padding and <image> token
+    pad_id = processor.tokenizer.pad_token_id
+    labels[input_ids == pad_id]         = -100
     labels[input_ids == image_token_id] = -100
 
     batch["labels"] = labels
@@ -171,8 +178,6 @@ if args.freeze == "vision":
     model.visual.requires_grad = False
 if args.freeze == "text":
     model.model.requires_grad = False
-
-print(model)
 
 # Training Setup
 training_args = SFTConfig(
@@ -216,7 +221,7 @@ if args.lora:
 train_data, eval_data = train_test_split(dataset.to_list(), test_size=args.eval_sample_percent, random_state=42)
 train_dataset = Dataset.from_list(train_data)
 eval_dataset = Dataset.from_list(eval_data)
-
+    
 trainer = SFTTrainer(
     model=model,
     args=training_args,
@@ -235,6 +240,7 @@ if args.lora:
     num_non_lora_params = sum([torch.prod(torch.tensor(p.shape)) for n, p in model.named_parameters() if "lora_" not in n])
     print(f"Number of non-LoRA parameters: {num_non_lora_params:,}")
     assert num_non_lora_params + num_lora_params == total_num_params, "Number of LoRA and non-LoRA parameters don't sum to total number of parameters"
+    trainer.save_pretrained_kwargs = {"save_peft_format": True}
 
 # Get metrics before training
 if args.evaluate_before_training:
@@ -248,7 +254,8 @@ def _save_and_exit(signum, frame):
     sys.exit(0)
 
 signal.signal(signal.SIGTERM, _save_and_exit)
-signal.signal(signal.SIGINT,  _save_and_exit)
+signal.signal(signal.SIGINT, _save_and_exit)
+signal.signal(signal.SIGUSR1, _save_and_exit) 
 
 # Train the model
 try:
