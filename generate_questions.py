@@ -105,9 +105,9 @@ if __name__ == "__main__":
     # os.chdir(root_dir)
     # Extract all files from output
     images_source = "output/images"
-    images_destination = "output/images_data"
+    images_destination = "testing_data"
     scenes_source = "output/scenes"
-    scenes_destination = "output/scenes_data"
+    scenes_destination = "scenes_data"
     extract_all_files(images_source, images_destination)
     extract_all_files(scenes_source, scenes_destination)
     # Generate questions

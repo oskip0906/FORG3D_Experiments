@@ -13,16 +13,17 @@ import re
 parser = argparse.ArgumentParser(description="Evaluate the model on a dataset.")
 parser.add_argument("--dataset", choices=["generated", "3dsr"], default="3dsr", help="Dataset type: 'generated' or '3dsr'.")
 parser.add_argument("--dataset_file", default="testing_data.jsonl", help="Path to the dataset file for generated data.")
-parser.add_argument("--peft_path", default="qwen_model", help="Path to the PEFT model.")
-parser.add_argument("--base_model", default="/scratch/ssd004/scratch/oskip123/qwen2-vl-2b-instruct", help="Path to the base model.")
+parser.add_argument("--peft_path", default=None, help="Path to the PEFT model.")
+parser.add_argument("--base_model", default="qwen2-vl-2b-instruct", help="Path to the base model.")
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def load_model_and_processor(base_model_path, peft_model_path):
     base_tokenizer = AutoTokenizer.from_pretrained(base_model_path)
-    peft_tokenizer = AutoTokenizer.from_pretrained(peft_model_path)
+    if peft_model_path is not None:
+        peft_tokenizer = AutoTokenizer.from_pretrained(peft_model_path)
     base_vocab = set(base_tokenizer.get_vocab().keys())
-    peft_vocab = peft_tokenizer.get_vocab()
+    peft_vocab = peft_tokenizer.get_vocab() if peft_model_path is not None else {}
     new_tokens = [tok for tok in peft_vocab if tok not in base_vocab]
     if new_tokens:
         base_tokenizer.add_tokens(new_tokens)
@@ -34,7 +35,10 @@ def load_model_and_processor(base_model_path, peft_model_path):
         ignore_mismatched_sizes=True,
     ).to(device)
     base_model.resize_token_embeddings(len(base_tokenizer))
-    model = PeftModel.from_pretrained(base_model, peft_model_path)
+    if peft_model_path is not None:
+        model = PeftModel.from_pretrained(base_model, peft_model_path)
+    else:
+        model = base_model
     model.eval().to(device)
     return processor, model
 

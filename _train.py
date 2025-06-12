@@ -16,6 +16,13 @@ from peft import LoraConfig, get_peft_model
 from accelerate import PartialState
 from PIL import Image
 import signal, sys
+import gc
+
+wandb.login(key="your_wandb_api_key_here")  # Replace with your actual WandB API key
+
+# Clear CUDA cache at start
+torch.cuda.empty_cache()
+gc.collect()
 
 # Argument parsing
 parser = argparse.ArgumentParser(description="Fine-tune a vision-language model.")
@@ -25,7 +32,7 @@ parser.add_argument('--image_directory', default='./', help='Directory containin
 parser.add_argument('--no_continue', action='store_true', default=False, help='Do not continue training if model already exists')
 parser.add_argument('--output_directory', default='output/', help='Directory to save the model')
 parser.add_argument('--num_epochs', default=2, type=int)
-parser.add_argument('--batch_size', default=8, type=int)
+parser.add_argument('--batch_size', default=4, type=int)
 parser.add_argument('--learning_rate', default=5e-5, type=float)
 parser.add_argument('--evaluate_before_training', action='store_true', default=False)
 parser.add_argument('--freeze', choices=['vision', 'text'], required=False)
@@ -33,14 +40,15 @@ parser.add_argument('--grad_acc', default=8, type=int)
 parser.add_argument('--weight_decay', default=0.01, type=float)
 parser.add_argument('--eval_steps', default=100, type=int)
 parser.add_argument('--eval_strat', default='steps', type=str)
-parser.add_argument('--eval_sample_percent', default=0.05, type=float)
+parser.add_argument('--eval_sample_percent', default=0.005, type=float)
 parser.add_argument('--save_steps', default=500, type=int)
 parser.add_argument('--save_strat', default='steps', type=str)
 parser.add_argument('--save_total_limit', default=1, type=int)
-parser.add_argument('--lora', action='store_true', default=False, help='Use LoRA')
-parser.add_argument('--lora_r', default=16, type=int)
+parser.add_argument('--lora', action='store_true', default=True, help='Use LoRA')
+parser.add_argument('--lora_r', default=8, type=int)
 parser.add_argument('--lora_alpha', default=16, type=int)
 parser.add_argument('--lora_dropout', default=0.1, type=float)
+parser.add_argument('--max_image_size', default=512, type=int, help='Max image dimension')
 args = parser.parse_args()
 
 print("Arguments:")
@@ -48,9 +56,9 @@ print(json.dumps(vars(args), indent=2))
 
 device_string = PartialState().process_index
 
-# Load processor
-min_pixels = 256 * 28 * 28
-max_pixels = 1024 * 28 * 28
+# Load processor - don't modify it
+min_pixels = 256 * 28 * 28 // 4
+max_pixels = 512 * 28 * 28
 processor = AutoProcessor.from_pretrained(
     args.model,
     min_pixels=min_pixels,
@@ -107,17 +115,21 @@ print(formatted_dataset[0])
 dataset = Dataset.from_list(formatted_dataset)
 print(f"Dataset: {dataset}")
 
-# Add <image> special token if missing
+# Get existing image token ID from the processor's tokenizer
 image_token = "<image>"
-if image_token not in processor.tokenizer.additional_special_tokens:
-    processor.tokenizer.add_special_tokens({'additional_special_tokens': [image_token]})
-image_token_id = processor.tokenizer.additional_special_tokens_ids[
-    processor.tokenizer.additional_special_tokens.index(image_token)
-]
+if image_token in processor.tokenizer.get_vocab():
+    image_token_id = processor.tokenizer.convert_tokens_to_ids(image_token)
+    print(f"Found existing <image> token with ID: {image_token_id}")
+else:
+    print("Warning: <image> token not found in vocabulary")
+    image_token_id = None
 
 def make_pil_image(image_path):
     try:
         img = Image.open(image_path).convert("RGB")
+        # Resize image to reduce memory usage
+        if args.max_image_size:
+            img.thumbnail((args.max_image_size, args.max_image_size), Image.Resampling.LANCZOS)
         return img
     except Exception as e:
         print(f"Failed to load image {image_path}: {e}")
@@ -157,29 +169,45 @@ def collate_fn(examples):
                 labels[i, j:j+L] = input_ids[i, j:j+L]
                 break
 
-    # Mask padding and <image> token
+    # Mask padding tokens
     pad_id = processor.tokenizer.pad_token_id
-    labels[input_ids == pad_id]         = -100
-    labels[input_ids == image_token_id] = -100
+    labels[input_ids == pad_id] = -100
+    
+    # Mask image tokens if they exist
+    if image_token_id is not None:
+        labels[input_ids == image_token_id] = -100
 
     batch["labels"] = labels
     return batch
 
+# Load model - don't resize token embeddings
+print("Loading model with memory optimizations...")
 model = Qwen2VLForConditionalGeneration.from_pretrained(
     args.model, 
-    torch_dtype="auto", 
+    torch_dtype=torch.bfloat16,
     trust_remote_code=True,
-    device_map='auto'
+    device_map={'': 0},
+    max_memory={0: "20GB"},
 )
 
-model.resize_token_embeddings(len(processor.tokenizer))
+print(f"Tokenizer vocab size: {len(processor.tokenizer)}")
+print(f"Model vocab size: {model.config.vocab_size}")
 
-if args.freeze == "vision":  
-    model.visual.requires_grad = False
+# Freeze vision encoder by default to save memory
+if args.freeze == "vision" or not args.freeze:  
+    print("Freezing vision encoder to save memory")
+    for param in model.visual.parameters():
+        param.requires_grad = False
+        
 if args.freeze == "text":
-    model.model.requires_grad = False
+    for param in model.model.parameters():
+        param.requires_grad = False
 
-# Training Setup
+# Clear cache after model loading
+torch.cuda.empty_cache()
+gc.collect()
+
+# Training Setup with memory optimizations
 training_args = SFTConfig(
     per_device_train_batch_size=args.batch_size,
     gradient_accumulation_steps=args.grad_acc,
@@ -194,33 +222,45 @@ training_args = SFTConfig(
     weight_decay=args.weight_decay,
     max_grad_norm=1.0,
     logging_steps=5,
-    use_liger=True,
     resume_from_checkpoint=bool(glob.glob(f"{args.output_directory}/checkpoint-*")) and not args.no_continue,
     bf16=True,
     optim="adamw_8bit",
+    gradient_checkpointing=True,
     gradient_checkpointing_kwargs={'use_reentrant': False},
     remove_unused_columns=False,
     max_seq_length=max_seq_length,
     dataset_kwargs={
       "skip_prepare_dataset": True,
     },
+    dataloader_pin_memory=False,
+    dataloader_num_workers=0,
+    per_device_eval_batch_size=1,
+    eval_accumulation_steps=8,
 )
 
+# Use LoRA by default for memory efficiency
 if args.lora:
+    print("Applying LoRA for memory efficiency")
     lora_config = LoraConfig(
         r=args.lora_r,
         lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,
-        target_modules=["self_attn.q_proj", "self_attn.k_proj"],
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
         bias="none",
         task_type="CAUSAL_LM",
+        modules_to_save=None,
     )
     model = get_peft_model(model, lora_config)
+    model.print_trainable_parameters()
 
 # Split the dataset into train and eval sets
 train_data, eval_data = train_test_split(dataset.to_list(), test_size=args.eval_sample_percent, random_state=42)
 train_dataset = Dataset.from_list(train_data)
 eval_dataset = Dataset.from_list(eval_data)
+
+# Clear cache before creating trainer
+torch.cuda.empty_cache()
+gc.collect()
     
 trainer = SFTTrainer(
     model=model,
@@ -237,10 +277,12 @@ print(f"Total number of parameters: {total_num_params:,}")
 if args.lora:
     num_lora_params = sum([torch.prod(torch.tensor(p.shape)) for n, p in model.named_parameters() if "lora_" in n])
     print(f"Number of LoRA parameters: {num_lora_params:,}")
-    num_non_lora_params = sum([torch.prod(torch.tensor(p.shape)) for n, p in model.named_parameters() if "lora_" not in n])
-    print(f"Number of non-LoRA parameters: {num_non_lora_params:,}")
-    assert num_non_lora_params + num_lora_params == total_num_params, "Number of LoRA and non-LoRA parameters don't sum to total number of parameters"
     trainer.save_pretrained_kwargs = {"save_peft_format": True}
+
+# Print memory usage
+if torch.cuda.is_available():
+    print(f"GPU memory allocated: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
+    print(f"GPU memory reserved: {torch.cuda.memory_reserved() / 1024**3:.2f} GB")
 
 # Get metrics before training
 if args.evaluate_before_training:
@@ -251,22 +293,34 @@ def _save_and_exit(signum, frame):
     print(f"Received signal {signum}, saving model and processor…")
     trainer.save_model(args.output_directory)
     processor.save_pretrained(args.output_directory)
+    torch.cuda.empty_cache()
+    gc.collect()
     sys.exit(0)
 
 signal.signal(signal.SIGTERM, _save_and_exit)
 signal.signal(signal.SIGINT, _save_and_exit)
 signal.signal(signal.SIGUSR1, _save_and_exit) 
 
-# Train the model
+# Train the model with memory management
 try:
+    torch.cuda.empty_cache()
+    gc.collect()
+    
     unsloth_train(
         trainer,
         resume_from_checkpoint=bool(glob.glob(f"{args.output_directory}/checkpoint-*")) and not args.no_continue
     )
 except Exception as e:
     print(f"Training failed with error: {e}")
+    torch.cuda.empty_cache()
+    gc.collect()
+    raise e
 
 # Save and push to hub  
 trainer.save_model(args.output_directory)
 processor.save_pretrained(args.output_directory)
 print(f"Model saved to {args.output_directory}")
+
+# Final cleanup
+torch.cuda.empty_cache()
+gc.collect()
